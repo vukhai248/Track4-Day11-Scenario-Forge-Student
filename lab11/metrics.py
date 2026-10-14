@@ -30,7 +30,59 @@ def min_ttc(R: core.Rollout, cap: float = 10.0) -> np.ndarray:
     Shapes: R.F is (K, NF, N, 7) with x, z, hx, hz, v, a, d; core.IX["ego"] is the ego's actor index.
     Vectorise over frames (a Python loop over 481 frames x K scenarios is too slow for Part C).
     """
-    raise NotImplementedError("TODO 1: min_ttc")
+    F = R.F
+    K, NF, N, _ = F.shape
+    EGO_I = core.IX["ego"]
+    ex = F[:, :, EGO_I, 0]
+    ez = F[:, :, EGO_I, 1]
+    ehx = F[:, :, EGO_I, 2]
+    ehz = F[:, :, EGO_I, 3]
+    ev = F[:, :, EGO_I, 4]
+    L = R.EGO[:, :, 3].astype(int)  # (K, NF)
+    has = L >= 0
+    Lc = np.clip(L, 0, N - 1)
+    # gather leader state via take_along_axis
+    Fx0 = F[..., 0]
+    Fx1 = F[..., 1]
+    Fv = F[..., 4]
+    lx = np.take_along_axis(Fx0, Lc[..., None], axis=2)[..., 0]
+    lz = np.take_along_axis(Fx1, Lc[..., None], axis=2)[..., 0]
+    lv = np.take_along_axis(Fv, Lc[..., None], axis=2)[..., 0]
+    # leader half length: 0.3 for peds, else LEN/2
+    if R.actors is not None and len(R.actors) == N:
+        is_ped = np.array([a.kind == "ped" for a in R.actors])
+        lens = np.array([a.dims[0] for a in R.actors], dtype=float)
+    else:
+        base_n = len(core.LEN)
+        if N == base_n:
+            is_ped = np.array(list(core.PEDS))
+            lens = np.array(core.LEN, dtype=float)
+        else:
+            # pad: extra hazard actors; guess ped by id prefix? fall back: H* ped/bike treated via dims
+            is_ped = np.zeros(N, dtype=bool)
+            is_ped[:base_n] = np.array(list(core.PEDS))
+            lens = np.zeros(N)
+            lens[:base_n] = np.array(core.LEN, dtype=float)
+            for j in range(base_n, N):
+                a = R.actors[j] if R.actors is not None else None
+                if a is not None:
+                    is_ped[j] = (a.kind == "ped")
+                    lens[j] = float(a.dims[0])
+                else:
+                    lens[j] = 4.6
+    half = np.where(is_ped, 0.3, lens / 2.0)  # (N,)
+    hlead = half[Lc]
+    lon = (lx - ex) * ehx + (lz - ez) * ehz
+    gap = np.maximum(lon - 2.3 - hlead, 0.0)
+    dv = ev - lv
+    ok = has & (dv > 0.1)
+    ttc = np.where(ok, gap / np.maximum(dv, 1e-6), np.inf)
+    out = np.minimum(cap, ttc.min(axis=1))
+    # crashed scenarios -> 0
+    for k in range(K):
+        if ego_events(R, k):
+            out[k] = 0.0
+    return out
 
 
 def contact_type(R: core.Rollout, k: int, event: dict) -> str:
@@ -39,13 +91,36 @@ def contact_type(R: core.Rollout, k: int, event: dict) -> str:
     Put the other actor in the ego's frame: lon = r . h, lat = -r_x h_z + r_z h_x with h = (hx, hz) of the ego.
     'front' if lon > 2.3 and |lat| < 1.6; 'rear' if lon < -2.3 and |lat| < 1.6; otherwise 'side'.
     """
-    raise NotImplementedError("TODO 2: contact_type")
+    f = int(event["f"])
+    ids = R.ids
+    a, b = event["a"], event["b"]
+    other_id = b if a == "ego" else a
+    ego_idx = ids.index("ego")
+    other_idx = ids.index(other_id)
+    ego_state = R.F[k, f, ego_idx]
+    oth_state = R.F[k, f, other_idx]
+    rx = float(oth_state[0] - ego_state[0])
+    rz = float(oth_state[1] - ego_state[1])
+    hx, hz = float(ego_state[2]), float(ego_state[3])
+    lon = rx * hx + rz * hz
+    lat = -rx * hz + rz * hx
+    if lon > 2.3 and abs(lat) < 1.6:
+        return "front"
+    if lon < -2.3 and abs(lat) < 1.6:
+        return "rear"
+    return "side"
 
 
 def progress_metrics(R: core.Rollout) -> tuple[np.ndarray, np.ndarray]:
     """TODO 9. Two (K,) arrays: the distance the ego covers in the 24 s (sum of frame-to-frame steps, metres),
     and the number of frames where the ego brakes harder than 3 m/s^2 (acceleration column < -3)."""
-    raise NotImplementedError("TODO 9: progress_metrics")
+    EGO_I = core.IX["ego"]
+    x = R.F[:, :, EGO_I, 0]
+    z = R.F[:, :, EGO_I, 1]
+    a = R.F[:, :, EGO_I, 5]
+    dist = np.sum(np.hypot(np.diff(x, axis=1), np.diff(z, axis=1)), axis=1)
+    harsh = np.sum(a < -3.0, axis=1).astype(int)
+    return dist, harsh
 
 
 # ---------------------------------------------------------------- given helpers
